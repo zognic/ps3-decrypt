@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""
+ps3-decrypt - Interactive PS3 ISO decryption helper
+
+Repository : https://github.com/zognic/ps3-decrypt
+License    : MIT
+
+Uses ps3decrs to decrypt PS3 ISOs using DKEY keys fetched from aldostools.
+
+References:
+  - ps3decrs (decryption binary) : https://github.com/Redrrx/ps3dec
+  - DKEY database                : https://ps3.aldostools.org/dkey.html
+
+Key lookup order:
+  1. ./keys/<iso_stem>.dkey  (local cache)
+  2. ./keys/<iso_stem>.key   (local cache, alternate ext)
+  3. Scrape https://ps3.aldostools.org/dkey.html (stdlib only) → save to ./keys/
+
+Binary lookup order:
+  1. Current working directory
+  2. /userdata/roms/ps3/
+  3. System PATH
+
+Usage: python3 ps3-decrypt [iso_directory]
+       No external dependencies required.
+
+MIT License
+
+Copyright (c) 2025 zognic
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+import hashlib
+import html
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+BINARY_NAME     = "ps3decrs"
+BINARY_DEFAULT_DIR = Path("/userdata/roms/ps3")
+ISO_EXTENSIONS  = {".iso"}
+DKEY_URL        = "https://ps3.aldostools.org/dkey.html"
+KEYS_DIR_NAME   = "keys"
+REQUEST_TIMEOUT = 15
+
+# ─── ANSI Colors ──────────────────────────────────────────────────────────────
+
+GREEN      = "\033[32m"
+GREEN_DIM  = "\033[2;32m"
+YELLOW = "\033[33m"
+RED    = "\033[31m"
+CYAN   = "\033[36m"
+RESET  = "\033[0m"
+
+# ─── Binary handling ──────────────────────────────────────────────────────────
+
+def find_binary():
+    """
+    Locate ps3decrs, auto-applying chmod +x if needed.
+    Search order:
+      1. Current working directory
+      2. /userdata/roms/ps3/
+      3. System PATH
+    """
+    candidates = [
+        Path(".") / BINARY_NAME,
+        BINARY_DEFAULT_DIR / BINARY_NAME,
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            if not os.access(candidate, os.X_OK):
+                print(f"  {YELLOW}[i]{RESET} '{candidate}' found but not executable — applying chmod +x...")
+                candidate.chmod(candidate.stat().st_mode | 0o111)
+                print(f"  {GREEN}[✔]{RESET} chmod +x applied.")
+            return candidate.resolve()
+
+    # Fallback to system PATH
+    found = shutil.which(BINARY_NAME)
+    return Path(found) if found else None
+
+# ─── HTTP (stdlib only) ───────────────────────────────────────────────────────
+
+def _make_ssl_ctx():
+    """Return an SSL context that tolerates self-signed certificates."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _fetch_url(url, binary=False):
+    """Fetch a URL using urllib. Returns bytes or str."""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 ps3decrypt/1.0"}
+    )
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=_make_ssl_ctx()) as resp:
+        data = resp.read()
+    return data if binary else data.decode("utf-8", errors="replace")
+
+# ─── Aldostools page cache ────────────────────────────────────────────────────
+
+_PAGE_CACHE: str | None = None
+_PAGE_CACHE_FILE: Path | None = None
+
+
+def _get_dkey_page() -> str | None:
+    """
+    Return the dkey.html content, using an in-memory + temp-file cache.
+    The temp file is deleted at script exit via _cleanup_cache().
+    """
+    global _PAGE_CACHE, _PAGE_CACHE_FILE
+
+    if _PAGE_CACHE is not None:
+        return _PAGE_CACHE
+
+    # Try to load from temp file (survives within the same session)
+    if _PAGE_CACHE_FILE and _PAGE_CACHE_FILE.exists():
+        _PAGE_CACHE = _PAGE_CACHE_FILE.read_text(encoding="utf-8")
+        return _PAGE_CACHE
+
+    print(f"  {CYAN}[i]{RESET} Downloading aldostools key database...")
+    try:
+        page = _fetch_url(DKEY_URL)
+    except Exception as e:
+        print(f"  {RED}[✘]{RESET} Could not reach aldostools: {e}")
+        return None
+
+    # Save to a named temp file
+    fd, tmp_path = tempfile.mkstemp(suffix=".html", prefix="ps3dkey_")
+    os.close(fd)
+    _PAGE_CACHE_FILE = Path(tmp_path)
+    _PAGE_CACHE_FILE.write_text(page, encoding="utf-8")
+    _PAGE_CACHE = page
+    print(f"  {GREEN}[✔]{RESET} Key database cached for this session.")
+    return _PAGE_CACHE
+
+
+def _cleanup_cache():
+    """Delete the temp cache file on exit."""
+    global _PAGE_CACHE_FILE
+    if _PAGE_CACHE_FILE and _PAGE_CACHE_FILE.exists():
+        try:
+            _PAGE_CACHE_FILE.unlink()
+        except Exception:
+            pass
+
+# ─── Key management ───────────────────────────────────────────────────────────
+
+def ensure_keys_dir(iso_dir):
+    """Create the keys directory next to the ISOs if it doesn't exist."""
+    keys_dir = iso_dir / KEYS_DIR_NAME
+    if not keys_dir.exists():
+        keys_dir.mkdir(parents=True)
+        print(f"  {CYAN}[i]{RESET} Created keys directory: {keys_dir}")
+    return keys_dir
+
+
+def find_local_key(keys_dir, iso_stem):
+    """Return existing .dkey or .key file for this ISO stem, or None."""
+    for ext in (".dkey", ".key"):
+        candidate = keys_dir / f"{iso_stem}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def fetch_key_from_web(iso_stem, keys_dir):
+    """
+    Parse the cached dkey.html to find the DKEY for iso_stem.
+
+    Row structure (7 cells after split on <TD>):
+      [0] empty  [1] Game ID  [2] ISO filename  [3] Size
+      [4] CRC32  [5] MD5      [6] DKEY  ← this one
+
+    Returns the Path of the saved .dkey file, or None if not found.
+    """
+    page = _get_dkey_page()
+    if page is None:
+        return None
+
+    iso_filename_lower = (iso_stem + ".iso").lower()
+    hex32 = re.compile(r'^[0-9A-Fa-f]{32}$')
+
+    for row in re.split(r'<TR>', page, flags=re.IGNORECASE):
+        cells = [
+            re.sub(r'<[^>]+>', '', td).strip()
+            for td in re.split(r'<TD>', row, flags=re.IGNORECASE)
+        ]
+        if len(cells) < 7:
+            continue
+        iso_col  = html.unescape(cells[2]).strip()
+        dkey_col = html.unescape(cells[6]).strip()
+
+        if iso_col.lower() == iso_filename_lower and hex32.match(dkey_col):
+            key_value = dkey_col.upper()
+            dest = keys_dir / f"{iso_stem}.dkey"
+            dest.write_text(key_value)
+            print(f"  {GREEN}[✔]{RESET} DKEY found → {dest.name}  ({key_value})")
+            return dest
+
+    print(f"  {YELLOW}[!]{RESET} Key for '{iso_stem}.iso' not found on aldostools.")
+    print(f"       Add it manually: {keys_dir / (iso_stem + '.dkey')}")
+    return None
+
+
+def has_remote_key(iso_stem) -> bool:
+    """Check without saving whether a key exists in the page for this ISO."""
+    page = _get_dkey_page()
+    if page is None:
+        return False
+    iso_filename_lower = (iso_stem + ".iso").lower()
+    hex32 = re.compile(r'^[0-9A-Fa-f]{32}$')
+    for row in re.split(r'<TR>', page, flags=re.IGNORECASE):
+        cells = [
+            re.sub(r'<[^>]+>', '', td).strip()
+            for td in re.split(r'<TD>', row, flags=re.IGNORECASE)
+        ]
+        if len(cells) < 7:
+            continue
+        if html.unescape(cells[2]).strip().lower() == iso_filename_lower:
+            if hex32.match(html.unescape(cells[6]).strip()):
+                return True
+    return False
+
+
+def resolve_key(iso, keys_dir):
+    """Ensure a key file exists for this ISO. Returns True if available."""
+    local_key = find_local_key(keys_dir, iso.stem)
+    if local_key:
+        print(f"  {GREEN}[✔]{RESET} Key found locally: {local_key.name}")
+        return True
+    fetched = fetch_key_from_web(iso.stem, keys_dir)
+    return fetched is not None
+
+# ─── Disk space check ─────────────────────────────────────────────────────────
+
+def check_disk_space(iso: Path) -> bool:
+    """
+    Warn if free space < ISO size (decrypted output ≈ same size as input).
+    Returns True if space is sufficient, False otherwise.
+    """
+    iso_size  = iso.stat().st_size
+    free      = shutil.disk_usage(iso.parent).free
+    iso_gb    = iso_size  / (1024 ** 3)
+    free_gb   = free      / (1024 ** 3)
+
+    if free < iso_size:
+        print(f"  {RED}[✘]{RESET} Not enough disk space!")
+        print(f"       Required : {iso_gb:.2f} GB")
+        print(f"       Available: {free_gb:.2f} GB")
+        return False
+
+    if free < iso_size * 1.1:
+        print(f"  {YELLOW}[!]{RESET} Low disk space — {free_gb:.2f} GB free for a {iso_gb:.2f} GB output.")
+    return True
+
+# ─── Checksum / Redump verification ──────────────────────────────────────────
+
+def compute_md5(path: Path) -> str:
+    """Compute MD5 of a file, reading in chunks to handle large ISOs."""
+    h = hashlib.md5()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def verify_redump(iso: Path):
+    """
+    Compute the ISO's MD5 and check it against the aldostools database.
+    The page stores MD5 in column [5] and ISO name in column [2].
+    """
+    print(f"\n  {CYAN}[i]{RESET} Computing MD5 for: {iso.name}")
+    print(f"       (this may take a while for large files...)")
+
+    md5 = compute_md5(iso)
+    print(f"  MD5  : {md5}")
+
+    page = _get_dkey_page()
+    if page is None:
+        print(f"  {YELLOW}[!]{RESET} Cannot verify — aldostools database unavailable.")
+        return
+
+    hex32 = re.compile(r'^[0-9A-Fa-f]{32}$')
+    for row in re.split(r'<TR>', page, flags=re.IGNORECASE):
+        cells = [
+            re.sub(r'<[^>]+>', '', td).strip()
+            for td in re.split(r'<TD>', row, flags=re.IGNORECASE)
+        ]
+        if len(cells) < 7:
+            continue
+        db_md5  = html.unescape(cells[5]).strip().lower()
+        db_name = html.unescape(cells[2]).strip()
+        if not hex32.match(db_md5):
+            continue
+        if db_md5 == md5:
+            print(f"  {GREEN}[✔]{RESET} Redump match! → {db_name}")
+            return
+
+    print(f"  {RED}[✘]{RESET} No Redump match found for this MD5.")
+    print(f"       The ISO may be modified, incomplete, or not in the database.")
+
+# ─── ISO listing ──────────────────────────────────────────────────────────────
+
+def list_isos(directory):
+    """Return sorted list of ISO files in directory (non-recursive)."""
+    return sorted(
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() in ISO_EXTENSIONS
+    )
+
+# ─── UI helpers ───────────────────────────────────────────────────────────────
+
+def print_banner():
+    print()
+    print("╔══════════════════════════════════════════╗")
+    print("║       PS3 ISO Decryptor  —  ps3decrs     ║")
+    print("╚══════════════════════════════════════════╝")
+    print()
+
+
+def key_icon(iso, keys_dir) -> str:
+    """Return 🔑 if a local key exists, 🌐 if found remotely, '  ' otherwise."""
+    if find_local_key(keys_dir, iso.stem):
+        return "🔑"
+    if has_remote_key(iso.stem):
+        return "🌐"
+    return "  "
+
+
+def print_iso_list(isos, keys_dir):
+    if not isos:
+        print("  [!] No ISO files found in this directory.\n")
+        return
+    print(f"  {'#':<5} {'':3} {'Filename'}")
+    print(f"  {'─'*5} {'─'*3} {'─'*60}")
+    for i, iso in enumerate(isos, start=1):
+        size_mb      = iso.stat().st_size / (1024 * 1024)
+        is_decrypted = iso.name.endswith("_decrypted.iso")
+        icon         = key_icon(iso, keys_dir)
+        label        = f"{iso.name}  ({size_mb:.0f} MB)"
+        if is_decrypted:
+            print(f"  {i:<5} {icon}  {GREEN_DIM}{label}{RESET}")
+        else:
+            print(f"  {i:<5} {icon}  {label}")
+    print()
+    print(f"  {GREEN}🔑 key cached locally   🌐 key available online{RESET}")
+    print()
+
+
+def print_help(iso_count):
+    print(f"  Enter a number [1-{iso_count}] to decrypt an ISO")
+    print("  'c <n>'       → verify checksum (e.g. 'c 2')")
+    print("  'a' or 'all'  → decrypt ALL (skips already decrypted)")
+    print("  'l' or Enter  → refresh / list ISOs again")
+    print("  'q'           → quit")
+    print()
+
+# ─── Decryption ───────────────────────────────────────────────────────────────
+
+def decrypt_iso(binary, iso, keys_dir, delete_after=False, batch=False):
+    """Resolve key, check disk space, then run ps3decrs --auto --skip."""
+    print()
+    print(f"  ► ISO : {iso.name}")
+
+    if not check_disk_space(iso):
+        print(f"  {RED}[✘]{RESET} Skipping due to insufficient disk space.\n")
+        return
+
+    key_ok = resolve_key(iso, keys_dir)
+    if not key_ok:
+        print(f"  {RED}[✘]{RESET} Cannot decrypt without a key. Skipping.\n")
+        return
+
+    print(f"  ► Running ps3decrs --auto --skip ...")
+    print()
+
+    cmd = [str(binary), str(iso), "--auto", "--skip"]
+    try:
+        result = subprocess.run(cmd, check=False)
+        print()
+        if result.returncode == 0:
+            print(f"  {GREEN}[✔]{RESET} Decryption completed successfully.")
+            if batch:
+                if delete_after:
+                    iso.unlink()
+                    print(f"  {YELLOW}[i]{RESET} '{iso.name}' deleted.")
+                else:
+                    print(f"  {CYAN}[i]{RESET} Original ISO kept.")
+            else:
+                try:
+                    answer = input(f"  Delete original ISO '{iso.name}' ? [y/N] : ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer == "y":
+                    iso.unlink()
+                    print(f"  {YELLOW}[i]{RESET} '{iso.name}' deleted.")
+                else:
+                    print(f"  {CYAN}[i]{RESET} Original ISO kept.")
+        else:
+            print(f"  {RED}[✘]{RESET} ps3decrs exited with code {result.returncode}.")
+    except FileNotFoundError:
+        print(f"  {RED}[✘]{RESET} Could not execute '{binary}'. Check permissions.")
+    except KeyboardInterrupt:
+        print("\n  [!] Interrupted by user.")
+    print()
+
+
+def decrypt_all(binary, isos, keys_dir):
+    """Decrypt all non-decrypted ISOs in batch mode."""
+    targets = [iso for iso in isos if not iso.name.endswith("_decrypted.iso")]
+
+    if not targets:
+        print(f"  {YELLOW}[!]{RESET} No ISOs to process (all are already decrypted).\n")
+        return
+
+    pending = []
+    for iso in targets:
+        decrypted_path = iso.parent / (iso.name + "_decrypted.iso")
+        if decrypted_path.exists():
+            print(f"  {YELLOW}[skip]{RESET} Already decrypted: {decrypted_path.name}")
+        else:
+            pending.append(iso)
+
+    if not pending:
+        print(f"\n  {GREEN}[✔]{RESET} All ISOs already have a decrypted version.\n")
+        return
+
+    print(f"\n  {CYAN}[i]{RESET} {len(pending)} ISO(s) to decrypt.")
+
+    try:
+        answer = input("  Delete each original ISO after successful decryption? [y/N] : ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    delete_originals = answer == "y"
+    print()
+
+    for i, iso in enumerate(pending, 1):
+        print(f"  ─── [{i}/{len(pending)}] ──────────────────────────────────────")
+        decrypt_iso(binary, iso, keys_dir, delete_after=delete_originals, batch=True)
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    import atexit
+    atexit.register(_cleanup_cache)
+
+    if len(sys.argv) > 1:
+        iso_dir = Path(sys.argv[1]).resolve()
+        if not iso_dir.is_dir():
+            print(f"{RED}[ERROR]{RESET} '{iso_dir}' is not a valid directory.")
+            sys.exit(1)
+    else:
+        iso_dir = Path.cwd()
+
+    print_banner()
+
+    binary = find_binary()
+    if binary is None:
+        print(f"{RED}[ERROR]{RESET} '{BINARY_NAME}' binary not found.")
+        print("        Make sure it is in the current directory or in your PATH.")
+        print("        Download it from: https://github.com/Redrrx/ps3dec")
+        sys.exit(1)
+
+    keys_dir = ensure_keys_dir(iso_dir)
+
+    print(f"  Binary : {binary}")
+    print(f"  ISO dir: {iso_dir}")
+    print(f"  Keys   : {keys_dir}")
+    print()
+
+    isos = list_isos(iso_dir)
+    print_iso_list(isos, keys_dir)
+
+    while True:
+        if isos:
+            print_help(len(isos))
+
+        try:
+            raw = input("  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Bye!")
+            sys.exit(0)
+
+        if raw in ("q", "quit", "exit"):
+            print("  Bye!")
+            sys.exit(0)
+
+        if raw in ("a", "all"):
+            decrypt_all(binary, isos, keys_dir)
+            isos = list_isos(iso_dir)
+            print_iso_list(isos, keys_dir)
+            continue
+
+        if raw in ("l", "list", ""):
+            isos = list_isos(iso_dir)
+            print_iso_list(isos, keys_dir)
+            continue
+
+        # Checksum command: "c 2"
+        if raw.startswith("c "):
+            parts = raw.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                choice = int(parts[1])
+                if 1 <= choice <= len(isos):
+                    verify_redump(isos[choice - 1])
+                    print()
+                else:
+                    print(f"  [!] Please enter a number between 1 and {len(isos)}.\n")
+            else:
+                print("  [!] Usage: c <number>  (e.g. 'c 2')\n")
+            continue
+
+        if raw.isdigit():
+            choice = int(raw)
+            if 1 <= choice <= len(isos):
+                decrypt_iso(binary, isos[choice - 1], keys_dir)
+                isos = list_isos(iso_dir)
+                print_iso_list(isos, keys_dir)
+            else:
+                print(f"  [!] Please enter a number between 1 and {len(isos)}.\n")
+            continue
+
+        print("  [!] Unknown command. Type 'l' to list, 'q' to quit.\n")
+
+
+if __name__ == "__main__":
+    main()
