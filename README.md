@@ -4,6 +4,13 @@ An interactive command-line tool to decrypt PS3 ISO files using [ps3decrs](https
 
 DKEY keys are automatically fetched from the [aldostools database](https://ps3.aldostools.org/dkey.html) and cached locally. No external Python dependencies required — stdlib only.
 
+
+
+
+https://github.com/user-attachments/assets/6e809602-5b15-4db1-9512-f44745352627
+
+
+
 ---
 
 ## Features
