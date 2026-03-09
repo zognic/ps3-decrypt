@@ -138,7 +138,7 @@ This tool is designed to work natively in a [Batocera](https://batocera.org) env
 - [ps3decrs](https://github.com/Redrrx/ps3dec) — PS3 ISO decryption binary by Redrrx
 - [aldostools DKEY database](https://ps3.aldostools.org/dkey.html) — PS3 decryption keys
 - [Redump](http://redump.org) — disc preservation database
-
+- [Redump All Keys](http://redump.org/dkeys/ps3/) - Redump also provides an up-to-date zip file of every key here
 ---
 
 ## License
